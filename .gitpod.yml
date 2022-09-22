@@ -1,0 +1,4 @@
+tasks:
+  - init: sudo apt update -y && sudo apt upgrade -y && sudo apt install ffmpeg -y && pip install virtualenv && virtualenv venv && source venv/bin/activate && pip install -r requirements.txt
+
+
