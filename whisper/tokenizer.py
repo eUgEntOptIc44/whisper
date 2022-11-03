@@ -178,8 +178,8 @@ class Tokenizer:
 
     @property
     @lru_cache()
-    def no_captions(self) -> int:
-        return self._get_single_token_id("<|nocaptions|>")
+    def no_speech(self) -> int:
+        return self._get_single_token_id("<|nospeech|>")
 
     @property
     @lru_cache()
@@ -245,9 +245,7 @@ class Tokenizer:
 
         keeping basic punctuations like commas, periods, question marks, exclamation points, etc.
         """
-
-        result = set()
-        symbols = list("'\"#()*+-/:;<=>@[\\]^_`{|}~「」『』")
+        symbols = list("\"#()*+/:;<=>@[\\]^_`{|}~「」『』")
         symbols += "<< >> <<< >>> -- --- -( -[ (' (\" (( )) ((( ))) [[ ]] {{ }} ♪♪ ♪♪♪".split()
 
         # symbols that may be a single token or multiple tokens depending on the tokenizer.
@@ -257,6 +255,8 @@ class Tokenizer:
         miscellaneous = set("♩♪♫♬♭♮♯")
         assert all(0x2640 <= ord(c) <= 0x267F for c in miscellaneous)
 
+        # allow hyphens "-" and single quotes "'" between words, but not at the beginning of a word
+        result = {self.tokenizer.encode(" -")[0], self.tokenizer.encode(" '")[0]}
         for symbol in symbols + list(miscellaneous):
             for tokens in [self.tokenizer.encode(symbol), self.tokenizer.encode(" " + symbol)]:
                 if len(tokens) == 1 or symbol in miscellaneous:
@@ -283,7 +283,7 @@ def build_tokenizer(name: str = "gpt2"):
         "<|transcribe|>",
         "<|startoflm|>",
         "<|startofprev|>",
-        "<|nocaptions|>",
+        "<|nospeech|>",
         "<|notimestamps|>",
     ]
 

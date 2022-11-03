@@ -78,7 +78,7 @@ class DecodingOptions:
     sample_len: Optional[int] = None  # maximum number of tokens to sample
     best_of: Optional[int] = None     # number of independent samples to collect, when t > 0
     beam_size: Optional[int] = None   # number of beams in beam search, when t == 0
-    patience: float = 0.0             # patience in beam search (https://arxiv.org/abs/2204.05424)
+    patience: Optional[float] = None  # patience in beam search (https://arxiv.org/abs/2204.05424)
 
     # options for ranking generations (either beams or best-of-N samples)
     length_penalty: Optional[float] = None   # "alpha" in Google NMT, None defaults to length norm
@@ -94,7 +94,7 @@ class DecodingOptions:
 
     # timestamp sampling options
     without_timestamps: bool = False              # use <|notimestamps|> to sample text tokens only
-    max_initial_timestamp: Optional[float] = 0.0  # the initial timestamp cannot be later than this
+    max_initial_timestamp: Optional[float] = 1.0  # the initial timestamp cannot be later than this
 
     # implementation details
     fp16: bool = True  # use fp16 for most of the calculation
@@ -108,7 +108,7 @@ class DecodingResult:
     tokens: List[int] = field(default_factory=list)
     text: str = ""
     avg_logprob: float = np.nan
-    no_caption_prob: float = np.nan
+    no_speech_prob: float = np.nan
     temperature: float = np.nan
     compression_ratio: float = np.nan
 
@@ -275,13 +275,15 @@ class GreedyDecoder(TokenDecoder):
 
 
 class BeamSearchDecoder(TokenDecoder):
-    def __init__(self, beam_size: int, eot: int, inference: Inference, patience: float = 0.0):
+    def __init__(self, beam_size: int, eot: int, inference: Inference, patience: Optional[float] = None):
         self.beam_size = beam_size
         self.eot = eot
         self.inference = inference
-        self.patience = patience
-        self.max_candidates: int = round(beam_size * (1.0 + patience))
+        self.patience = patience or 1.0
+        self.max_candidates: int = round(beam_size * self.patience)
         self.finished_sequences = None
+
+        assert self.max_candidates > 0, f"Invalid beam size ({beam_size}) or patience ({patience})"
 
     def reset(self):
         self.finished_sequences = None
@@ -496,8 +498,8 @@ class DecodingTask:
         if options.temperature == 0:
             if options.best_of is not None:
                 raise ValueError("best_of with greedy sampling (T=0) is not compatible")
-        if options.patience != 0.0 and options.beam_size is None:
-            raise ValueError("nonzero patience requires beam_size to be given")
+        if options.patience is not None and options.beam_size is None:
+            raise ValueError("patience requires beam_size to be given")
         if options.length_penalty is not None and not (0 <= options.length_penalty <= 1):
             raise ValueError("length_penalty (alpha) should be a value between 0 and 1")
 
@@ -537,15 +539,14 @@ class DecodingTask:
         elif suppress_tokens is None or len(suppress_tokens) == 0:
             suppress_tokens = []  # interpret empty string as an empty list
         else:
-            assert isinstance(self.options.suppress_tokens, list), "suppress_tokens must be a list"
-            suppress_tokens = self.options.suppress_tokens
+            assert isinstance(suppress_tokens, list), "suppress_tokens must be a list"
 
         suppress_tokens.extend(
             [self.tokenizer.sot, self.tokenizer.sot_prev, self.tokenizer.sot_lm]
         )
-        if self.tokenizer.no_captions is not None:
-            # no-captions probability is collected separately
-            suppress_tokens.append(self.tokenizer.no_captions)
+        if self.tokenizer.no_speech is not None:
+            # no-speech probability is collected separately
+            suppress_tokens.append(self.tokenizer.no_speech)
 
         return tuple(sorted(set(suppress_tokens)))
 
@@ -580,15 +581,15 @@ class DecodingTask:
         assert audio_features.shape[0] == tokens.shape[0]
         n_batch = tokens.shape[0]
         sum_logprobs: Tensor = torch.zeros(n_batch, device=audio_features.device)
-        no_caption_probs = [np.nan] * n_batch
+        no_speech_probs = [np.nan] * n_batch
 
         try:
             for i in range(self.sample_len):
                 logits = self.inference.logits(tokens, audio_features)
 
-                if i == 0 and self.tokenizer.no_captions is not None:  # save no_caption_probs
+                if i == 0 and self.tokenizer.no_speech is not None:  # save no_speech_probs
                     probs_at_sot = logits[:, self.sot_index].float().softmax(dim=-1)
-                    no_caption_probs = probs_at_sot[:, self.tokenizer.no_captions].tolist()
+                    no_speech_probs = probs_at_sot[:, self.tokenizer.no_speech].tolist()
 
                 # now we need to consider the logits at the last token only
                 logits = logits[:, -1]
@@ -605,7 +606,7 @@ class DecodingTask:
         finally:
             self.inference.cleanup_caching()
 
-        return tokens, sum_logprobs, no_caption_probs
+        return tokens, sum_logprobs, no_speech_probs
 
     @torch.no_grad()
     def run(self, mel: Tensor) -> List[DecodingResult]:
@@ -614,7 +615,7 @@ class DecodingTask:
         n_audio: int = mel.shape[0]
 
         audio_features: Tensor = self._get_audio_features(mel)  # encoder forward pass
-        tokens: Tensor = torch.tensor([self.initial_tokens]).expand(n_audio, -1)
+        tokens: Tensor = torch.tensor([self.initial_tokens]).repeat(n_audio, 1)
 
         # detect language if requested, overwriting the language token
         languages, language_probs = self._detect_language(audio_features, tokens)
@@ -629,12 +630,12 @@ class DecodingTask:
         tokens = tokens.repeat_interleave(self.n_group, dim=0).to(audio_features.device)
 
         # call the main sampling loop
-        tokens, sum_logprobs, no_caption_probs = self._main_loop(audio_features, tokens)
+        tokens, sum_logprobs, no_speech_probs = self._main_loop(audio_features, tokens)
 
         # reshape the tensors to have (n_audio, n_group) as the first two dimensions
         audio_features = audio_features[:: self.n_group]
-        no_caption_probs = no_caption_probs[:: self.n_group]
-        assert audio_features.shape[0] == len(no_caption_probs) == n_audio
+        no_speech_probs = no_speech_probs[:: self.n_group]
+        assert audio_features.shape[0] == len(no_speech_probs) == n_audio
 
         tokens = tokens.reshape(n_audio, self.n_group, -1)
         sum_logprobs = sum_logprobs.reshape(n_audio, self.n_group)
@@ -653,7 +654,7 @@ class DecodingTask:
         sum_logprobs: List[float] = [lp[i] for i, lp in zip(selected, sum_logprobs)]
         avg_logprobs: List[float] = [lp / (len(t) + 1) for t, lp in zip(tokens, sum_logprobs)]
 
-        fields = (texts, languages, tokens, audio_features, avg_logprobs, no_caption_probs)
+        fields = (texts, languages, tokens, audio_features, avg_logprobs, no_speech_probs)
         if len(set(map(len, fields))) != 1:
             raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
 
@@ -664,11 +665,11 @@ class DecodingTask:
                 tokens=tokens,
                 text=text,
                 avg_logprob=avg_logprob,
-                no_caption_prob=no_caption_prob,
+                no_speech_prob=no_speech_prob,
                 temperature=self.options.temperature,
                 compression_ratio=compression_ratio(text),
             )
-            for text, language, tokens, features, avg_logprob, no_caption_prob in zip(*fields)
+            for text, language, tokens, features, avg_logprob, no_speech_prob in zip(*fields)
         ]
 
 
